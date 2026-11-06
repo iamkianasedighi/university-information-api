@@ -1,55 +1,82 @@
-Overview: 
-This API is designed to interact with a MySQL database for a university system. It provides endpoints to fetch data from various tables, insert new records, and retrieve class enrollment information for students. The API is built using FastAPI and interacts with a MySQL database.
+# University Information API
 
-Setup: 
-Base URL: http://localhost:8000
-Database: MySQL
-Database Name: uni
+A small FastAPI and MySQL project for managing students and class enrollments. It also provides SQL-based enrollment statistics.
 
-Tables:
-STDinfo (Student Information)
-PROFinfo (Professor Information)
-CLASSinfo (Class Information)
-ENROLLinfo (Enrollment Information)
+I first developed the university API in 2024. I revisited it in November 2026 to improve the data model, finish the enrollment workflow, and add tests and Docker support.
 
-Endpoints: 
-1. Fetch Table Data
-Endpoint: GET /fetch_table/
-Description: Retrieves all records from a specified table.
-Query Parameters:
-table_name (str): The name of the table to fetch data from. Valid values are "STDinfo", "PROFinfo", "CLASSinfo", "ENROLLinfo".
-Responses:
-200 OK: Returns the data from the specified table.
-400 Bad Request: Returns an error if the table name is invalid.
-500 Internal Server Error: Returns an error if a database error occurs.
-2. Insert Data
-Endpoint: POST /insert/
-Description: Inserts a new student record into the STDinfo table.
-Request Body:
-name (str): The name of the student.
-phone (int): The student's phone number.
-Responses:
-200 OK: Returns a success message if the data is inserted successfully.
-400 Bad Request: Returns an error if the phone number already exists in the database.
-500 Internal Server Error: Returns an error if an unexpected issue occurs.
-3. Get Students
-Endpoint: GET /students/
-Description: Retrieves a list of all students with their IDs and names from the STDinfo table.
-Responses:
-200 OK: Returns a list of students with their IDs and names.
-500 Internal Server Error: Returns an error if a database error occurs.
-4. Get Enrolled Class
-Endpoint: GET /enrolled_class/
-Description: Retrieves the name of the class that a student is enrolled in based on the student ID.
-Query Parameters:
-student_id (int): The ID of the student whose class enrollment information is requested.
+## Run with Docker
 
-Responses:
-200 OK: Returns the name of the class the student is enrolled in.
-404 Not Found: Returns an error if no class is found for the given student ID.
-500 Internal Server Error: Returns an error if a database error occurs.
+With Docker Desktop running:
 
-Error Handling:
-400 Bad Request: Invalid request parameters or data.
-404 Not Found: Requested resource or data not found.
-500 Internal Server Error: Issues with the database or unexpected errors.
+```sh
+docker compose up --build -d
+```
+
+Open http://localhost:8000/docs to try the API. MySQL is initialized automatically from `uni.sql` on the first run. The API uses port `8000` and the demo MySQL server uses local port `3307`.
+
+Stop with `docker compose down`. To start over with the original sample data, run `docker compose down -v` first. **This deletes the demo database volume.** Credentials in `compose.yaml` are for local testing only.
+
+## Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/students` | List students |
+| POST | `/students` | Create a student |
+| GET | `/students/{student_id}` | Get one student |
+| GET | `/students/{student_id}/classes` | List a student's classes |
+| GET | `/classes` | List classes and professors |
+| POST | `/enrollments` | Enroll a student in a class |
+| GET | `/analytics/overview` | Enrollment statistics |
+
+Example requests:
+
+```http
+POST /students HTTP/1.1
+Content-Type: application/json
+
+{"name": "Alex Meyer", "phone": "+12025550188"}
+```
+
+```http
+POST /enrollments HTTP/1.1
+Content-Type: application/json
+
+{"student_id": 14, "class_id": 6}
+```
+
+Phones use international format. Duplicate phone numbers or enrollments return `409`; an enrollment with an unknown student or class returns `404`.
+
+## Data and analytics
+
+`uni.sql` creates four related tables: `STDinfo`, `PROFinfo`, `CLASSinfo`, and `ENROLLinfo`. It uses foreign keys and unique constraints to protect the relationships.
+
+On a fresh database, the fictional sample data has 20 students, 4 professors, 6 classes, and 18 enrollments. The analytics endpoint uses `NOT EXISTS` to count students without enrollments and `LEFT JOIN` / `GROUP BY` to include classes with zero enrollments.
+
+## Tests
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+For the MySQL integration test, start Docker Compose and enable the test. On Windows CMD:
+
+```cmd
+set RUN_MYSQL_TESTS=1
+python -m pytest -q
+```
+
+On Linux/macOS, run `RUN_MYSQL_TESTS=1 python -m pytest -q`. The integration test creates temporary records, checks changes relative to the existing data, and removes its records afterward. GitHub Actions runs the same suite with a fresh MySQL container.
+
+## Run without Docker
+
+Use a separate MySQL 8 database, import `uni.sql` into it, and set `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME`. The SQL file drops and recreates the demo tables, so don't import it into a database you need to keep. Then run:
+
+```sh
+python -m pip install -r requirements.txt
+python -m uvicorn API_uni:app --reload
+```
+
+## Project history
+
+The 2024 version supported student insertion, table browsing, student listing, and class lookup. The 2026 update introduced REST-style routes, enrollment creation, schema constraints, cleaner sample data, SQL analytics, tests, and Docker. The original commits remain in the [project repository](https://github.com/iamkianasedighi/APIuniByKianaSedighi).
