@@ -1,115 +1,229 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi import Request
-from pydantic import BaseModel
+"""University records and enrollment statistics, built with FastAPI and MySQL."""
+
+import logging
+import os
+
 import mysql.connector
-from typing import Optional
+from mysql.connector import errorcode
+from fastapi import Depends, FastAPI, HTTPException, Path, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 
-# Create an instance of FastAPI
-app = FastAPI()
+app = FastAPI(title="University Information API", version="2.0.0")
+logger = logging.getLogger(__name__)
 
-mydb = mysql.connector.connect(
-  host="localhost",
-  user="root",
-  password="",
-  database="uni"
+OVERVIEW_SQL = """
+SELECT
+    (SELECT COUNT(*) FROM STDinfo) AS total_students,
+    (SELECT COUNT(*) FROM CLASSinfo) AS total_classes,
+    (SELECT COUNT(*) FROM ENROLLinfo) AS total_enrollments,
+    (SELECT COUNT(*) FROM STDinfo AS s
+     WHERE NOT EXISTS (
+         SELECT 1 FROM ENROLLinfo AS e WHERE e.STDid = s.id
+     )) AS students_without_enrollments
+"""
+
+CLASS_ENROLLMENTS_SQL = """
+SELECT c.id AS class_id, c.name AS class_name,
+       COUNT(e.id) AS enrollment_count
+FROM CLASSinfo AS c
+LEFT JOIN ENROLLinfo AS e ON e.CLASSid = c.id
+GROUP BY c.id, c.name
+ORDER BY enrollment_count DESC, c.id
+"""
+
+
+class StudentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    phone: str = Field(pattern=r"^\+[1-9]\d{7,14}$", max_length=16)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("Name cannot be blank")
+        return name
+
+
+class StudentOut(BaseModel):
+    id: int
+    name: str
+
+
+class ClassOut(BaseModel):
+    id: int
+    name: str
+    teacher_id: int
+    teacher_name: str
+
+
+class EnrollmentCreate(BaseModel):
+    student_id: int = Field(gt=0)
+    class_id: int = Field(gt=0)
+
+
+class EnrollmentOut(EnrollmentCreate):
+    id: int
+
+
+class ClassCount(BaseModel):
+    class_id: int
+    class_name: str
+    enrollment_count: int
+
+
+class OverviewOut(BaseModel):
+    total_students: int
+    total_classes: int
+    total_enrollments: int
+    students_without_enrollments: int
+    enrollments_by_class: list[ClassCount]
+    most_popular_class: ClassCount | None
+
+
+def get_db():
+    try:
+        db = mysql.connector.connect(
+            host=os.getenv("DB_HOST", "127.0.0.1"),
+            port=int(os.getenv("DB_PORT", "3306")),
+            user=os.getenv("DB_USER", "root"),
+            password=os.getenv("DB_PASSWORD", ""),
+            database=os.getenv("DB_NAME", "uni"),
+            connection_timeout=5,
+        )
+    except mysql.connector.Error:
+        logger.exception("Could not connect to MySQL")
+        raise HTTPException(status_code=503, detail="Database unavailable") from None
+
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@app.exception_handler(mysql.connector.Error)
+async def database_error_handler(request: Request, exc: mysql.connector.Error):
+    logger.error("Database error at %s: %s", request.url.path, exc)
+    return JSONResponse(status_code=500, content={"detail": "Database operation failed"})
+
+
+@app.get("/students", response_model=list[StudentOut])
+def list_students(db=Depends(get_db)):
+    with db.cursor(dictionary=True) as cursor:
+        cursor.execute("SELECT id, name FROM STDinfo ORDER BY id")
+        return cursor.fetchall()
+
+
+@app.post(
+    "/students",
+    status_code=201,
+    response_model=StudentOut,
+    responses={409: {"description": "Phone number is already registered"}},
 )
-###############################
-#task1
-#function of showing the chosen table
-
-def fetch_table_data(table_name: str):
-    allowed_tables = {"STDinfo", "PROFinfo", "CLASSinfo", "ENROLLinfo"}
-    
-    if table_name not in allowed_tables:
-        raise HTTPException(status_code=400, detail="Invalid table name")
-    else:
-        try:
-            mycursor = mydb.cursor(dictionary=True)  # Using dictionary=True for JSON-like results
-            mycursor.execute(f"SELECT * FROM {table_name}")
-            results = mycursor.fetchall()
-            return results
-        except mysql.connector.Error as e:
-            raise HTTPException(status_code=500, detail=f"Database error: {e}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
-
-@app.get("/fetch_table/")
-async def fetch_table(table_name: str):
-    data = fetch_table_data(table_name)
-    return {"data": data}
-###############################
-#task2
-# Function to insert data into the database
-def insert_function(newName: str, newPhone: int):
+def create_student(data: StudentCreate, db=Depends(get_db)):
     try:
-        newcursor = mydb.cursor()
-        # Check if the phone number already exists in the database
-        newcursor.execute(f"SELECT * FROM STDinfo WHERE phone = {newPhone}")
-        existing_row = newcursor.fetchone()
-        
-        # If the phone number is new, insert a new row
-        if not existing_row:
-            newcursor.execute(f"INSERT INTO STDinfo (name, phone) VALUES ({newName}, {newPhone})")
-            # Commit the transaction to save changes
-            mydb.commit()
-            return {"message": "Data inserted successfully!"}
-        else:
-            # If the phone number already exists, return an error message
-            return {"error": "This person is already in the database"}
-    except Exception as e:
-        # Raise an HTTPException if there's an error during the database operation
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
-# Define a Pydantic model for the request body
-class DataModel(BaseModel):
-    name: str   # Name field
-    phone: int  # Phone field
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO STDinfo (name, phone) VALUES (%s, %s)",
+                (data.name, data.phone),
+            )
+            student_id = cursor.lastrowid
+        db.commit()
+    except mysql.connector.IntegrityError as exc:
+        db.rollback()
+        if exc.errno == errorcode.ER_DUP_ENTRY:
+            raise HTTPException(status_code=409, detail="Phone number already registered") from None
+        raise
+    except mysql.connector.Error:
+        db.rollback()
+        raise
+    return {"id": student_id, "name": data.name}
 
 
-# Define a POST endpoint to insert data into the database
-@app.post("/insert/")
-async def insert_data(request: Request, data: DataModel):
+@app.get("/students/{student_id}", response_model=StudentOut)
+def get_student(student_id: int = Path(gt=0), db=Depends(get_db)):
+    with db.cursor(dictionary=True) as cursor:
+        cursor.execute("SELECT id, name FROM STDinfo WHERE id = %s", (student_id,))
+        student = cursor.fetchone()
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return student
+
+
+@app.get("/classes", response_model=list[ClassOut])
+def list_classes(db=Depends(get_db)):
+    with db.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            """
+            SELECT c.id, c.name, p.id AS teacher_id, p.name AS teacher_name
+            FROM CLASSinfo AS c
+            JOIN PROFinfo AS p ON p.id = c.teacher
+            ORDER BY c.id
+            """
+        )
+        return cursor.fetchall()
+
+
+@app.get("/students/{student_id}/classes", response_model=list[ClassOut])
+def student_classes(student_id: int = Path(gt=0), db=Depends(get_db)):
+    with db.cursor(dictionary=True, buffered=True) as cursor:
+        cursor.execute("SELECT id FROM STDinfo WHERE id = %s", (student_id,))
+        if cursor.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Student not found")
+        cursor.execute(
+            """
+            SELECT c.id, c.name, p.id AS teacher_id, p.name AS teacher_name
+            FROM ENROLLinfo AS e
+            JOIN CLASSinfo AS c ON c.id = e.CLASSid
+            JOIN PROFinfo AS p ON p.id = c.teacher
+            WHERE e.STDid = %s
+            ORDER BY c.id
+            """,
+            (student_id,),
+        )
+        return cursor.fetchall()
+
+
+@app.post(
+    "/enrollments",
+    status_code=201,
+    response_model=EnrollmentOut,
+    responses={
+        404: {"description": "Student or class does not exist"},
+        409: {"description": "Student is already enrolled in this class"},
+    },
+)
+def create_enrollment(data: EnrollmentCreate, db=Depends(get_db)):
     try:
-        # Call the insert_function with the data from the request body
-        result = insert_function(data.name, data.phone)
-        return result
-    except HTTPException as e:
-        # Propagate any HTTPException that occurs
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-###############################
-#task3
-#finding the given name's student name of the classes this person has enrolled
-#we aim to tell the user name of the class this person enrolled
-def get_student_names():
-    try:
-        cursor = mydb.cursor(dictionary=True)
-        cursor.execute("SELECT id, name FROM STDinfo")
-        results = cursor.fetchall()
-        return results
-    except mysql.connector.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error to fetch students name: {e}")
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO ENROLLinfo (STDid, CLASSid) VALUES (%s, %s)",
+                (data.student_id, data.class_id),
+            )
+            enrollment_id = cursor.lastrowid
+        db.commit()
+    except mysql.connector.IntegrityError as exc:
+        db.rollback()
+        if exc.errno == errorcode.ER_DUP_ENTRY:
+            raise HTTPException(status_code=409, detail="Student already enrolled in this class") from None
+        if exc.errno == errorcode.ER_NO_REFERENCED_ROW_2:
+            raise HTTPException(status_code=404, detail="Student or class not found") from None
+        raise
+    except mysql.connector.Error:
+        db.rollback()
+        raise
+    return {"id": enrollment_id, "student_id": data.student_id, "class_id": data.class_id}
 
-def get_enrolled_class(student_id: int):
-    try:
-        cursor = mydb.cursor(dictionary=True)
-        cursor.execute("SELECT CLASSid FROM ENROLLinfo WHERE STDid = %s", (student_id,))
-        class_id_result = cursor.fetchone()
-        if class_id_result: #explanation behind
-            class_id = class_id_result['CLASSid'] #explanation behind
-            cursor.execute("SELECT name FROM CLASSinfo WHERE id = %s", (class_id,))
-            class_name_result = cursor.fetchone()
-            return class_name_result['name'] if class_name_result else None #explanation behind
-        return None
-    except mysql.connector.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-@app.get("/students/")
-async def get_students():
-    students = get_student_names()
-    return {"students": students}
 
-@app.get("/enrolled_class/")
-async def get_enrolled_class_name(student_id: int):
-    class_name = get_enrolled_class(student_id)
-    if class_name:
-        return {"enrolled_class_name": class_name}
-    else:
-        raise HTTPException(status_code=404, detail=f"No class found for Student ID {student_id}.")
+@app.get("/analytics/overview", response_model=OverviewOut)
+def enrollment_overview(db=Depends(get_db)):
+    with db.cursor(dictionary=True, buffered=True) as cursor:
+        cursor.execute(OVERVIEW_SQL)
+        totals = cursor.fetchone()
+        cursor.execute(CLASS_ENROLLMENTS_SQL)
+        counts = cursor.fetchall()
+
+    # A class with zero enrollments should not be called most popular.
+    popular = counts[0] if counts and counts[0]["enrollment_count"] > 0 else None
+    return {**totals, "enrollments_by_class": counts, "most_popular_class": popular}
