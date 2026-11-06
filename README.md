@@ -1,5 +1,7 @@
 # University Information API
 
+[![Tests](https://github.com/iamkianasedighi/university-information-api/actions/workflows/tests.yml/badge.svg)](https://github.com/iamkianasedighi/university-information-api/actions/workflows/tests.yml)
+
 A small FastAPI and MySQL project for managing students and class enrollments. It also provides SQL-based enrollment statistics.
 
 I first developed the university API in 2024. I revisited it in November 2026 to improve the data model, finish the enrollment workflow, and add tests and Docker support.
